@@ -40,6 +40,7 @@ ONNX_MODEL_PATH = "/media/gt/My Passport/onnx_model/yolov8s.onnx"
 ENGINE_FILE_PATH = "yolov8s.engine" # Or .trt
 NUM_MIPI_CAMERAS = 4
 THERMAL_CAM_DEVICE = "/dev/video1" # As determined previously
+DYNAMIC_THERMAL_CAM_DEVICE = None # Will be set by find_thermal_camera_device
 
 # GStreamer pipeline elements (placeholders, to be detailed)
 # Example for one camera with appsink:
@@ -85,6 +86,54 @@ stop_event = threading.Event()
 
 # Filter the specific deprecation warning
 warnings.filterwarnings("ignore", category=DeprecationWarning, message=".*Use get_tensor_name instead.*")
+
+def find_thermal_camera_device(keywords=["FLIR", "Boson", "Thermal"]):
+    """
+    Finds the thermal camera device by parsing v4l2-ctl output.
+    Looks for specified keywords in the device names.
+    Returns the path to the first video node (e.g., /dev/videoX) found for such a device.
+    """
+    print("Attempting to find thermal camera device...")
+    try:
+        result = subprocess.run(['v4l2-ctl', '--list-devices', '--verbose'], capture_output=True, text=True, check=True)
+        output_lines = result.stdout.splitlines()
+        
+        current_device_name = None
+        for i, line in enumerate(output_lines):
+            line_stripped = line.strip()
+            if not line_stripped: # Skip empty lines
+                continue
+
+            # Check if this line is a device name (usually not indented)
+            # and contains any of the keywords
+            if not line.startswith(('\\t', ' ')) and any(keyword.lower() in line_stripped.lower() for keyword in keywords):
+                current_device_name = line_stripped
+                print(f"Found potential thermal camera section: '{current_device_name}'")
+                # Look for /dev/videoX in the immediately following lines
+                for j in range(i + 1, len(output_lines)):
+                    next_line_stripped = output_lines[j].strip()
+                    if not next_line_stripped: # Skip empty lines
+                        continue
+                    if next_line_stripped.startswith("/dev/video"):
+                        print(f"Found device node: {next_line_stripped} for {current_device_name}")
+                        return next_line_stripped
+                    elif not output_lines[j].startswith(('\\t', ' ')):
+                        # We've hit the next device name without finding a /dev/video node for the current one
+                        current_device_name = None # Reset, as this was not it or format is unexpected
+                        break 
+                current_device_name = None # Reset if no /dev/video found under it
+        
+        print("No thermal camera device found matching keywords or /dev/videoX node structure.")
+        return None
+    except FileNotFoundError:
+        print("ERROR: v4l2-ctl command not found. Is v4l-utils installed?")
+        return None
+    except subprocess.CalledProcessError as e:
+        print(f"ERROR: v4l2-ctl command failed: {e}")
+        return None
+    except Exception as e:
+        print(f"An unexpected error occurred while finding thermal camera: {e}")
+        return None
 
 def check_or_build_engine(onnx_path, engine_path):
     """
@@ -149,8 +198,10 @@ def initialize_gstreamer_pipelines():
     MIPI cameras output RGBA (NVMM) to appsink.
     Thermal camera outputs BGR (System) to appsink.
     Appsink will emit 'new-sample' signal.
+    Uses DYNAMIC_THERMAL_CAM_DEVICE if set.
     """
     global _active_pipelines
+    global DYNAMIC_THERMAL_CAM_DEVICE # Ensure we're using the global
     appsinks = {}
     pipelines = []
 
@@ -185,8 +236,18 @@ def initialize_gstreamer_pipelines():
     
     # Thermal Camera (v4l2src)
     # Scale thermal to target resolution, convert to BGR system memory
+    
+    # Use the dynamically found device if available, otherwise fall back to the hardcoded one (or error)
+    thermal_device_to_use = DYNAMIC_THERMAL_CAM_DEVICE if DYNAMIC_THERMAL_CAM_DEVICE else THERMAL_CAM_DEVICE
+    if not thermal_device_to_use:
+        print("CRITICAL ERROR: No thermal camera device specified or found. Cannot create thermal pipeline.")
+        # Potentially return None, None or raise an exception to stop further processing
+        return None, None # Or handle more gracefully
+
+    print(f"Using thermal camera device: {thermal_device_to_use}")
+
     thermal_pipeline_str = (
-        f"v4l2src device={THERMAL_CAM_DEVICE} ! "
+        f"v4l2src device={thermal_device_to_use} ! " # Use the determined device
         f"videoscale ! video/x-raw,width={TARGET_WIDTH},height={TARGET_HEIGHT} ! " # Added videoscale - corrected brace
         f"videoconvert ! video/x-raw,format=BGR ! "
         f"appsink name=sink_thermal emit-signals=true max-buffers=1 drop=true" # drop=true again
@@ -569,27 +630,51 @@ def inference_loop(appsinks, engine, context):
         print("Cleaned up GStreamer pipelines and OpenCV windows.")
 
 def main():
-    global YOLO_INPUT_SHAPE, YOLO_OUTPUT_NAMES, tensorrt_context, host_inputs, cuda_inputs, host_outputs, cuda_outputs, stream
-    global tensorrt_engine 
-    tensorrt_engine = None
-    tensorrt_context = None 
-    cuda_context = None 
-    worker_thread = None # Initialize worker_thread
-
-    # Simple OpenCV display test
-    print("Attempting simple OpenCV display test...")
-    try:
-        blank_image = np.zeros((100, 200, 3), np.uint8)
-        cv2.imshow("OpenCV Test Window", blank_image)
-        cv2.waitKey(500) # Display for 0.5 seconds
-        cv2.destroyWindow("OpenCV Test Window") # Try to close it explicitly
-        print("OpenCV display test window should have appeared and closed.")
-    except Exception as e:
-        print(f"OpenCV display test failed: {e}")
-
-    Gst.init(None)
+    global PYCUDA_INITIALIZED_SUCCESSFULLY
+    global tensorrt_engine, tensorrt_context
+    global host_inputs, cuda_inputs, host_outputs, cuda_outputs, stream
+    global DYNAMIC_THERMAL_CAM_DEVICE # Make it global here to set it
+    global YOLO_INPUT_SHAPE, YOLO_OUTPUT_NAMES # Explicitly declare as global
 
     print("Script starting...")
+    Gst.init(None) # Initialize GStreamer
+
+    # Attempt to init CUDA driver and context if PyCUDA is available
+    if PYCUDA_AVAILABLE:
+        try:
+            print("Attempting to init CUDA driver and retain/push primary context...")
+            cuda.init()
+            # Attempt to retain the primary context for the device
+            # This might fail if an X server or another CUDA app has a conflicting context
+            # Or if no CUDA device is found/usable
+            device = cuda.Device(0) # Assuming device 0
+            # Create a context, or get the primary context
+            # For primary context:
+            # primary_ctx = device.retain_primary_context()
+            # primary_ctx.push()
+            # For a new context (simpler if primary context handling is tricky):
+            ctx = device.make_context() # Create a new context on the device
+            ctx.push() # Push the context to the current CPU thread
+
+            PYCUDA_INITIALIZED_SUCCESSFULLY = True
+            print("Primary CUDA context pushed successfully.")
+        except cuda.Error as e:
+            print(f"PyCUDA: CUDA Error during init/context push: {e}")
+            print("Continuing without PyCUDA GPU acceleration for TensorRT if possible, or script may fail at inference.")
+            PYCUDA_INITIALIZED_SUCCESSFULLY = False
+            # Optional: exit if CUDA is absolutely required from the start
+            # sys.exit("Exiting: Critical CUDA initialization failed.")
+        except Exception as e:
+            print(f"PyCUDA: An unexpected error occurred during CUDA initialization: {e}")
+            PYCUDA_INITIALIZED_SUCCESSFULLY = False
+
+
+    # Find the thermal camera device automatically
+    DYNAMIC_THERMAL_CAM_DEVICE = find_thermal_camera_device()
+    if not DYNAMIC_THERMAL_CAM_DEVICE:
+        print("Warning: Could not automatically find a thermal camera. Will try the default or fail.")
+        # The initialize_gstreamer_pipelines function will handle the fallback or error.
+
     print(f"Attempting to use ONNX model: {ONNX_MODEL_PATH}")
     print(f"Target engine file: {ENGINE_FILE_PATH}")
 
@@ -598,7 +683,12 @@ def main():
         sys.exit(1)
 
     try: 
-        if PYCUDA_AVAILABLE: 
+        if PYCUDA_INITIALIZED_SUCCESSFULLY: 
+            # Ensure these are None before attempting to set them from engine
+            YOLO_INPUT_SHAPE = None
+            YOLO_OUTPUT_NAMES = None
+            cuda_context = None # Initialize for the finally block
+            worker_thread = None # Initialize for the finally block
             try:
                 print("Attempting to init CUDA driver and retain/push primary context...")
                 cuda.init() # Explicitly initialize the driver API first
@@ -751,7 +841,7 @@ def main():
 
     finally:
         # Ensure worker thread is stopped if it was started
-        if worker_thread is not None and worker_thread.is_alive():
+        if 'worker_thread' in locals() and worker_thread is not None and worker_thread.is_alive():
             print("Signalling worker thread to stop (main finally)...")
             stop_event.set()
             worker_thread.join(timeout=2.0)
@@ -759,7 +849,7 @@ def main():
                  print("Worker thread did not stop gracefully (main finally).")
         
         # Ensure primary CUDA context is popped/released
-        if cuda_context:
+        if 'cuda_context' in locals() and cuda_context is not None:
             try:
                 cuda_context.pop()
                 print("Primary CUDA context popped.")
