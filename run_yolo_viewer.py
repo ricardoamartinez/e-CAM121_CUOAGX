@@ -57,6 +57,7 @@ TARGET_HEIGHT = 480 # Added
 
 # Expected YOLO input shape (channels, height, width)
 YOLO_MODEL_PRECISION = np.float32
+TARGET_YOLO_FPS_PER_STREAM = 2.0 # Target FPS for YOLO processing per stream (Reduced from 10.0)
 # Let's assume model expects BGR, CHW, and specific size (e.g., 640x640)
 # This will be confirmed/set when loading the engine
 YOLO_INPUT_SHAPE = None # (3, 640, 640) - Will be set from engine
@@ -72,20 +73,46 @@ tensorrt_engine = None
 tensorrt_context = None
 host_inputs, cuda_inputs, host_outputs, cuda_outputs = [], [], [], []
 stream = None
+YOLO_MODEL_OUTPUT_SHAPE = None # Will be set from engine
 
 # Globals for combined view
 latest_frames = {}
 frame_lock = threading.Lock()
-TILE_WIDTH = TARGET_WIDTH  # Use target resolution
-TILE_HEIGHT = TARGET_HEIGHT # Use target resolution
+TILE_WIDTH = TARGET_WIDTH  # Use target resolution - Will be updated in main()
+TILE_HEIGHT = TARGET_HEIGHT # Use target resolution - Will be updated in main()
+last_inference_submit_time = {} # For FPS throttling
+latest_raw_camera_frames = {} # Stores latest raw BGR frames from cameras
+latest_detected_objects = {}  # Stores latest (detections_list, original_frame_shape, timestamp)
 
 # Globals for worker thread # Added section
 frame_input_queue = queue.Queue(maxsize=(NUM_MIPI_CAMERAS + 1) * 2) # Allow some buffering
-frame_output_queue = queue.Queue()
+detections_output_queue = queue.Queue() # NEW - for detection results from worker
 stop_event = threading.Event()
 
 # Filter the specific deprecation warning
 warnings.filterwarnings("ignore", category=DeprecationWarning, message=".*Use get_tensor_name instead.*")
+
+def get_scaled_dimensions(original_w, original_h, target_w, target_h):
+    """Calculates scaled dimensions to fit within target_w, target_h, preserving aspect ratio."""
+    if original_w == 0 or original_h == 0: # Prevent division by zero
+        return target_w, target_h # Or some other default, like original scaled if possible
+
+    original_aspect = original_w / original_h
+    target_aspect = target_w / target_h
+
+    if original_aspect > target_aspect:
+        # Original is wider than target: scale by width
+        scaled_w = target_w
+        scaled_h = int(target_w / original_aspect)
+    else:
+        # Original is taller than or same aspect as target: scale by height
+        scaled_h = target_h
+        scaled_w = int(target_h * original_aspect)
+    
+    # Ensure dimensions are at least 1x1 and even (often preferred by video encoders/elements)
+    scaled_w = max(1, scaled_w // 2 * 2) 
+    scaled_h = max(1, scaled_h // 2 * 2)
+    return scaled_w, scaled_h
 
 def find_thermal_camera_device(keywords=["FLIR", "Boson", "Thermal"]):
     """
@@ -163,7 +190,8 @@ def check_or_build_engine(onnx_path, engine_path):
             "--explicitBatch",
             "--fp16",
             "--workspace=4096",
-            "--verbose" # Adding verbose flag for trtexec for more detailed terminal output
+            "--verbose", # Adding verbose flag for trtexec for more detailed terminal output
+            "--best" # Add --best flag for potentially better engine optimization
         ]
         print(f"Executing: {' '.join(command_list)}")
         print(f"Timeout set to 1200 seconds (20 minutes). This may take a while and output will be verbose...")
@@ -195,28 +223,50 @@ def check_or_build_engine(onnx_path, engine_path):
 def initialize_gstreamer_pipelines():
     """
     Initializes GStreamer pipelines for all cameras with appsinks.
-    MIPI cameras output RGBA (NVMM) to appsink.
-    Thermal camera outputs BGR (System) to appsink.
+    All cameras output BGR (System memory) at YOLO model input dimensions.
     Appsink will emit 'new-sample' signal.
-    Uses DYNAMIC_THERMAL_CAM_DEVICE if set.
+    Uses DYNAMIC_THERMAL_CAM_DEVICE if set and YOLO_INPUT_SHAPE global.
     """
     global _active_pipelines
     global DYNAMIC_THERMAL_CAM_DEVICE # Ensure we're using the global
+    global YOLO_INPUT_SHAPE # Access the model's input shape
+
     appsinks = {}
     pipelines = []
 
     print("Initializing GStreamer pipelines...")
 
-    # MIPI Cameras
+    if YOLO_INPUT_SHAPE is None:
+        print("ERROR: YOLO_INPUT_SHAPE is not set. Cannot determine target GStreamer resolution.")
+        # Fallback to original TARGET_WIDTH, TARGET_HEIGHT or error out
+        # For now, let's use the constants, but this indicates an issue if inference is expected
+        pipeline_target_w = TARGET_WIDTH
+        pipeline_target_h = TARGET_HEIGHT
+        print(f"Warning: Using default TARGET_WIDTH/HEIGHT for GStreamer: {pipeline_target_w}x{pipeline_target_h}")
+    else:
+        pipeline_target_h = YOLO_INPUT_SHAPE[1] # Height is dimension 1 (C, H, W)
+        pipeline_target_w = YOLO_INPUT_SHAPE[2] # Width is dimension 2
+        print(f"GStreamer target resolution set to: {pipeline_target_w}x{pipeline_target_h} (from YOLO_INPUT_SHAPE)")
+
+    # --- MIPI Cameras ---
     for i in range(NUM_MIPI_CAMERAS):
-        # Scale to TARGET_WIDTHxTARGET_HEIGHT, convert to RGBA system memory
+        # Calculate scaled dimensions for MIPI camera to fit within pipeline_target_w/h
+        scaled_mipi_w, scaled_mipi_h = get_scaled_dimensions(
+            MIPI_WIDTH, MIPI_HEIGHT, pipeline_target_w, pipeline_target_h
+        )
+        print(f"MIPI Cam {i}: Original {MIPI_WIDTH}x{MIPI_HEIGHT} -> Scaled by GStreamer to {scaled_mipi_w}x{scaled_mipi_h} (BGR for appsink). OpenCV will pad.")
+
         pipeline_str = (
             f"nvarguscamerasrc sensor-id={i} sensor-mode={MIPI_SENSOR_MODE} ! "
             f"video/x-raw(memory:NVMM),width={MIPI_WIDTH},height={MIPI_HEIGHT},framerate={MIPI_FRAMERATE}/1,format=NV12 ! "
-            f"nvvidconv ! " # Scaling element
-            f"video/x-raw(memory:NVMM),width={TARGET_WIDTH},height={TARGET_HEIGHT} ! " # Scale to target size - corrected brace
-            f"nvvidconv ! video/x-raw,format=RGBA ! " # Convert format, output to system memory
-            f"appsink name=sink{i} emit-signals=true max-buffers=1 drop=true" # drop=true again
+            # 1. Scale with aspect ratio using nvvidconv (output NVMM at scaled_mipi_w x scaled_mipi_h)
+            f"nvvidconv ! video/x-raw(memory:NVMM),width={scaled_mipi_w},height={scaled_mipi_h},format=NV12 ! "
+            # 2. Convert to BGRx system memory, with explicit dimensions
+            f"nvvidconv ! video/x-raw,format=BGRx,width={scaled_mipi_w},height={scaled_mipi_h} ! "
+            # 3. Convert BGRx to BGR
+            f"videoconvert ! video/x-raw,format=BGR ! "
+            f"queue ! "
+            f"appsink name=sink{i} emit-signals=true max-buffers=1 drop=true"
         )
         print(f"MIPI Cam {i} pipeline: {pipeline_str}")
         try:
@@ -234,39 +284,47 @@ def initialize_gstreamer_pipelines():
             print(f"ERROR: Failed to parse or create pipeline for MIPI Cam {i}: {e}")
             return None, None
     
-    # Thermal Camera (v4l2src)
-    # Scale thermal to target resolution, convert to BGR system memory
-    
-    # Use the dynamically found device if available, otherwise fall back to the hardcoded one (or error)
-    thermal_device_to_use = DYNAMIC_THERMAL_CAM_DEVICE if DYNAMIC_THERMAL_CAM_DEVICE else THERMAL_CAM_DEVICE
-    if not thermal_device_to_use:
-        print("CRITICAL ERROR: No thermal camera device specified or found. Cannot create thermal pipeline.")
-        # Potentially return None, None or raise an exception to stop further processing
-        return None, None # Or handle more gracefully
+    # Thermal Camera
+    if DYNAMIC_THERMAL_CAM_DEVICE:
+        thermal_cam_id = f"sink_thermal"
+        
+        # Placeholder for actual thermal camera original dimensions - IMPORTANT: Update these if known!
+        # Using 640x512 as a common FLIR Boson resolution for aspect calculation.
+        # If your thermal camera is different, these values MUST be updated.
+        thermal_original_w = 640 
+        thermal_original_h = 512 
+        # It would be best to query these using v4l2-ctl if possible, but that's more complex to integrate here.
 
-    print(f"Using thermal camera device: {thermal_device_to_use}")
+        scaled_thermal_w, scaled_thermal_h = get_scaled_dimensions(
+            thermal_original_w, thermal_original_h, pipeline_target_w, pipeline_target_h
+        )
+        print(f"Thermal Cam: Assumed Original {thermal_original_w}x{thermal_original_h} -> Scaled by GStreamer to {scaled_thermal_w}x{scaled_thermal_h} (BGR for appsink). OpenCV will pad.")
 
-    thermal_pipeline_str = (
-        f"v4l2src device={thermal_device_to_use} ! " # Use the determined device
-        f"videoscale ! video/x-raw,width={TARGET_WIDTH},height={TARGET_HEIGHT} ! " # Added videoscale - corrected brace
-        f"videoconvert ! video/x-raw,format=BGR ! "
-        f"appsink name=sink_thermal emit-signals=true max-buffers=1 drop=true" # drop=true again
-    )
-    print(f"Thermal Cam pipeline string: {thermal_pipeline_str}")
-    try:
-        thermal_pipeline = Gst.parse_launch(thermal_pipeline_str)
-        thermal_appsink = thermal_pipeline.get_by_name("sink_thermal")
-        if not thermal_pipeline or not thermal_appsink:
-            print(f"ERROR: Failed to create pipeline or get appsink for Thermal Cam")
-            # Potentially return or handle error
+        pipeline_str_thermal = (
+            f"v4l2src device={DYNAMIC_THERMAL_CAM_DEVICE} ! "
+            # Assuming v4l2src outputs a raw format that videoscale can handle
+            # 1. Scale with aspect ratio using videoscale (system memory)
+            f"videoscale ! video/x-raw,width={scaled_thermal_w},height={scaled_thermal_h} ! "
+            # 2. Convert to BGR system memory at scaled_thermal_w x scaled_thermal_h
+            f"videoconvert ! video/x-raw,format=BGR,width={scaled_thermal_w},height={scaled_thermal_h} ! "
+            f"queue ! "
+            f"appsink name={thermal_cam_id} emit-signals=true max-buffers=1 drop=true"
+        )
+        print(f"Thermal Cam pipeline: {pipeline_str_thermal}")
+        try:
+            pipeline_thermal = Gst.parse_launch(pipeline_str_thermal)
+            thermal_appsink = pipeline_thermal.get_by_name("sink_thermal")
+            if not pipeline_thermal or not thermal_appsink:
+                print(f"ERROR: Failed to create pipeline or get appsink for Thermal Cam")
+                # Potentially return or handle error
+                return None, None
+            pipeline_thermal.set_state(Gst.State.PLAYING)
+            print(f"Thermal Cam pipeline created and set to PLAYING.")
+            appsinks["thermal"] = thermal_appsink
+            pipelines.append(pipeline_thermal)
+        except Exception as e:
+            print(f"ERROR: Failed to parse or create pipeline for Thermal Cam: {e}")
             return None, None
-        thermal_pipeline.set_state(Gst.State.PLAYING)
-        print(f"Thermal Cam pipeline created and set to PLAYING.")
-        appsinks["thermal"] = thermal_appsink
-        pipelines.append(thermal_pipeline)
-    except Exception as e:
-        print(f"ERROR: Failed to parse or create pipeline for Thermal Cam: {e}")
-        return None, None
 
     _active_pipelines = pipelines # Store pipelines to keep them alive
     return appsinks, pipelines
@@ -290,15 +348,19 @@ def load_tensorrt_engine(engine_path):
     return engine, context
 
 def preprocess_frame_yolo(frame, input_shape):
-    """Prepares a frame for YOLOv8 inference (resize, normalize, CHW)."""
-    # input_shape is expected to be (Channels, Height, Width) e.g. (3, 640, 640)
-    # cv2.resize dsize is (width, height)
-    target_h = input_shape[1]
-    target_w = input_shape[2]
-    resized_frame = cv2.resize(frame, (target_w, target_h)) # Corrected: (width, height)
-    normalized_frame = resized_frame.astype(YOLO_MODEL_PRECISION) / 255.0
-    chw_frame = np.transpose(normalized_frame, (2, 0, 1))
-    return np.ascontiguousarray(np.expand_dims(chw_frame, axis=0))
+    """
+    Prepares a frame for YOLOv8 inference (normalize, CHW).
+    Assumes frame is already BGR and at the correct dimensions (H, W) as per input_shape.
+    input_shape is expected to be (Channels, Height, Width) e.g. (3, 640, 640)
+    """
+    # Frame from GStreamer is HWC, BGR, and should be correct size.
+    # input_shape is CHW.
+    # Assert frame.shape[:2] == (input_shape[1], input_shape[2]), "Frame dimensions mismatch input_shape"
+    # No resize needed as GStreamer pipeline should provide correctly sized frames.
+    # resized_frame = cv2.resize(frame, (input_shape[2], input_shape[1])) # Removed
+    normalized_frame = frame.astype(YOLO_MODEL_PRECISION) / 255.0
+    chw_frame = np.transpose(normalized_frame, (2, 0, 1)) # HWC to CHW
+    return np.ascontiguousarray(np.expand_dims(chw_frame, axis=0)) # Add batch dimension
 
 def postprocess_yolo_output(outputs, frame_shape, input_shape, confidence_threshold=0.5, nms_threshold=0.45):
     """
@@ -438,15 +500,16 @@ def inference_worker(engine, context, bindings, stream, host_input, host_output,
             
             # print(f"Worker found {len(detections)} detections for {cam_name}") # Can be verbose
 
-            frame_with_boxes = frame
-            for (x1, y1, x2, y2, score, class_id) in detections:
-                cv2.rectangle(frame_with_boxes, (x1, y1), (x2, y2), (0, 255, 0), 2)
-                label = f"C{int(class_id)}: {score:.2f}"
-                cv2.putText(frame_with_boxes, label, (x1, y1 - 10), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 0), 2)
+            # frame_with_boxes = frame # OLD: Worker used to draw
+            # for (x1, y1, x2, y2, score, class_id) in detections:
+            #     cv2.rectangle(frame_with_boxes, (x1, y1), (x2, y2), (0, 255, 0), 2)
+            #     label = f"C{int(class_id)}: {score:.2f}"
+            #     cv2.putText(frame_with_boxes, label, (x1, y1 - 10), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 0), 2)
 
             # --- Timing (now for all frames processed) --- 
             iter_end_time = time.time()
             processing_time = iter_end_time - iter_start_time
+            print(f"WORKER: Processed {cam_name} in {processing_time*1000:.2f} ms")
             processing_times.append(processing_time)
             frame_count += 1
             if frame_count % 100 == 0:
@@ -456,7 +519,8 @@ def inference_worker(engine, context, bindings, stream, host_input, host_output,
 
             # Put the processed frame onto the output queue
             try:
-                frame_output_queue.put_nowait((cam_name, frame_with_boxes))
+                # frame_output_queue.put_nowait((cam_name, frame_with_boxes)) # OLD
+                detections_output_queue.put_nowait((cam_name, original_frame_shape, detections))
             except queue.Full:
                 pass
 
@@ -475,8 +539,8 @@ def inference_loop(appsinks, engine, context):
 
     # --- Get buffer refs created in main --- 
     # This assumes main() populates these lists correctly
-    if not host_inputs or not cuda_inputs or not host_outputs or not cuda_outputs or not stream:
-        print("CRITICAL ERROR: Buffers or stream not initialized correctly in main before inference_loop.")
+    if not host_inputs or not cuda_inputs or not host_outputs or not cuda_outputs or not stream or YOLO_MODEL_OUTPUT_SHAPE is None:
+        print("CRITICAL ERROR: Buffers, stream, or YOLO_MODEL_OUTPUT_SHAPE not initialized correctly in main before inference_loop.")
         return
         
     # Assuming single input/output for simplicity now
@@ -485,16 +549,17 @@ def inference_loop(appsinks, engine, context):
     h_output = host_outputs[0]
     d_output = cuda_outputs[0]
     bindings = [int(d_input), int(d_output)]
-    model_output_shape = (1, 84, 8400) # TODO: Get this robustly from engine in main
+    # model_output_shape = (1, 84, 8400) # TODO: Get this robustly from engine in main - NOW USING YOLO_MODEL_OUTPUT_SHAPE
     # --- End Get buffer refs --- 
 
     loop = GLib.MainLoop()
     print("GLib.MainLoop created for main inference.")
     
     # --- Start Inference Worker Thread --- 
+    # Ensure YOLO_MODEL_OUTPUT_SHAPE is passed here
     worker_thread = threading.Thread(
         target=inference_worker, 
-        args=(engine, context, bindings, stream, h_input, h_output, d_input, d_output, YOLO_INPUT_SHAPE, model_output_shape),
+        args=(engine, context, bindings, stream, h_input, h_output, d_input, d_output, YOLO_INPUT_SHAPE, YOLO_MODEL_OUTPUT_SHAPE),
         daemon=True # Allows main thread to exit even if worker is blocked
     )
     worker_thread.start()
@@ -514,13 +579,18 @@ def inference_loop(appsinks, engine, context):
                     gst_frame_w = caps.get_structure(0).get_value("width")
                     
                     img_format_str = caps.get_structure(0).get_value("format")
-                    num_channels = 3
-                    if img_format_str == "RGBA":
-                        num_channels = 4
-                    
+                    # With simplified pipelines, we expect BGR directly from appsink at scaled dimensions
+                    if img_format_str == "BGR":
+                        num_channels = 3
+                    else:
+                        # This case should ideally not happen with the new pipelines
+                        print(f"Warning: Unexpected GStreamer format {img_format_str} for {current_cam_name_for_log}. Expected BGR. Attempting to handle as 3 or 4 channel.")
+                        num_channels = 4 if "A" in img_format_str or "x" in img_format_str else 3
+
                     map_flags = Gst.MapFlags.READ
                     success, map_info = buf.map(map_flags)
                     if not success:
+                        buf.unmap(map_info) # Ensure unmap even on failure to map
                         return Gst.FlowReturn.OK
 
                     expected_size = gst_frame_h * gst_frame_w * num_channels
@@ -533,18 +603,88 @@ def inference_loop(appsinks, engine, context):
                     frame_writable_copy = frame_from_gst.copy()
                     buf.unmap(map_info)
 
-                    # Convert to BGR if needed, as worker expects BGR
-                    if img_format_str == "RGBA":
-                        bgr_frame = cv2.cvtColor(frame_writable_copy, cv2.COLOR_RGBA2BGR)
-                    else:
-                        bgr_frame = frame_writable_copy
+                    # --- OpenCV Letterboxing --- 
+                    # The frame_writable_copy is now aspect-ratio correct but might be smaller 
+                    # than pipeline_target_w x pipeline_target_h. We need to pad it.
+                    
+                    # Get the dimensions of the incoming frame (e.g., 640x360)
+                    incoming_h, incoming_w = frame_writable_copy.shape[:2]
 
-                    # Put BGR frame onto the input queue for the worker
-                    try:
-                        frame_input_queue.put_nowait((current_cam_name_for_log, bgr_frame))
-                    except queue.Full:
-                        # print(f"Input queue full, dropping frame for {current_cam_name_for_log}") # Verbose
-                        pass # Drop frame if input queue is full
+                    # Target dimensions for the canvas (YOLO model input size, e.g., 640x640)
+                    # These should be available from where pipeline_target_w/h are defined, 
+                    # typically from YOLO_INPUT_SHAPE after engine load.
+                    # Re-accessing them here for clarity, ensure they are correctly scoped or passed.
+                    # Fallback if YOLO_INPUT_SHAPE isn't set, though it should be by now.
+                    canvas_h = YOLO_INPUT_SHAPE[1] if YOLO_INPUT_SHAPE and len(YOLO_INPUT_SHAPE) >= 2 else TARGET_HEIGHT
+                    canvas_w = YOLO_INPUT_SHAPE[2] if YOLO_INPUT_SHAPE and len(YOLO_INPUT_SHAPE) >= 3 else TARGET_WIDTH
+
+                    if img_format_str != "BGR":
+                        # If somehow not BGR, try to convert. This is a fallback.
+                        print(f"Frame format for {current_cam_name_for_log} is {img_format_str}, converting to BGR before letterboxing.")
+                        if num_channels == 4 and (img_format_str == "BGRx" or img_format_str == "BGRA"):
+                            frame_writable_copy = cv2.cvtColor(frame_writable_copy, cv2.COLOR_BGRA2BGR if 'A' in img_format_str else cv2.COLOR_BGRx2BGR)
+                        elif num_channels == 4 and (img_format_str == "RGBA"):
+                             frame_writable_copy = cv2.cvtColor(frame_writable_copy, cv2.COLOR_RGBA2BGR)
+                        # Add other conversions if necessary, or error out
+                        elif num_channels == 3: # If it's 3 channels but not BGR (e.g. RGB), this won't fix it without knowing specific format
+                            pass # Assume it's BGR-like or hope for the best if it's an unknown 3-channel format
+
+                    # Create a black canvas
+                    # Ensure frame_writable_copy is 3 channels if canvas is 3 channels
+                    if frame_writable_copy.shape[2] != 3 and num_channels == 4: # e.g. BGRx became 3 channel somehow
+                         # This should not happen if format conversion above is correct
+                         print(f"Correcting channel mismatch for {current_cam_name_for_log} before letterbox. Is {frame_writable_copy.shape}, num_channels from caps {num_channels}")
+                         # frame_writable_copy = cv2.cvtColor(frame_writable_copy, cv2.COLOR_BGRA2BGR) # Example, might need specific conversion
+
+                    # Ensure canvas_h and canvas_w are integers
+                    canvas_h = int(canvas_h)
+                    canvas_w = int(canvas_w)
+
+                    letterboxed_frame = np.full((canvas_h, canvas_w, 3), 0, dtype=np.uint8)
+                    
+                    # Calculate offsets to center the frame
+                    x_offset = (canvas_w - incoming_w) // 2
+                    y_offset = (canvas_h - incoming_h) // 2
+                    
+                    # Paste the frame onto the canvas
+                    # Ensure incoming frame dimensions are not larger than canvas slice
+                    paste_h = min(incoming_h, canvas_h - y_offset)
+                    paste_w = min(incoming_w, canvas_w - x_offset)
+
+                    if y_offset < 0 : y_offset = 0 # Should not happen if get_scaled_dimensions works
+                    if x_offset < 0 : x_offset = 0 # Should not happen
+                    
+                    # Only try to paste if the frame has valid dimensions
+                    if paste_h > 0 and paste_w > 0 and frame_writable_copy.shape[0] > 0 and frame_writable_copy.shape[1] > 0:
+                        try:
+                           letterboxed_frame[y_offset:y_offset+paste_h, x_offset:x_offset+paste_w] = frame_writable_copy[0:paste_h, 0:paste_w]
+                           bgr_frame = letterboxed_frame
+                        except ValueError as e:
+                            print(f"ERROR during letterboxing paste for {current_cam_name_for_log}: {e}")
+                            print(f"Canvas: {letterboxed_frame.shape}, Frame: {frame_writable_copy.shape}, Paste slice: y={y_offset}:{y_offset+paste_h}, x={x_offset}:{x_offset+paste_w}")
+                            bgr_frame = frame_writable_copy # Fallback to unpadded frame
+                    else:
+                        print(f"Warning: Invalid dimensions for letterboxing for {current_cam_name_for_log}. Frame: {incoming_w}x{incoming_h}, Scaled Paste: {paste_w}x{paste_h}. Using unpadded frame.")
+                        bgr_frame = frame_writable_copy # Fallback
+                    # --- End OpenCV Letterboxing ---
+
+                    # Always update the latest_frames for immediate display
+                    with frame_lock:
+                        latest_raw_camera_frames[current_cam_name_for_log] = bgr_frame.copy() # Store a copy for display
+
+                    # Throttle frames sent to inference worker
+                    current_time = time.time()
+                    time_since_last_submit = current_time - last_inference_submit_time.get(current_cam_name_for_log, 0.0)
+                    
+                    if time_since_last_submit > (1.0 / TARGET_YOLO_FPS_PER_STREAM):
+                        try:
+                            frame_input_queue.put_nowait((current_cam_name_for_log, bgr_frame)) # Send the original bgr_frame for processing
+                            last_inference_submit_time[current_cam_name_for_log] = current_time
+                        except queue.Full:
+                            # print(f"Input queue full, dropping throttled frame for {current_cam_name_for_log}") # Verbose
+                            pass # Drop frame if input queue is full even after throttling
+                    # else:
+                        # print(f"Skipping inference for {current_cam_name_for_log} due to FPS throttle.") # Can be verbose
                     
                 return Gst.FlowReturn.OK
 
@@ -554,12 +694,15 @@ def inference_loop(appsinks, engine, context):
         # check_cv_events now handles combined display based on output queue
         def check_cv_events(): 
             # Process frames from the output queue
-            while not frame_output_queue.empty():
+            # while not frame_output_queue.empty(): # OLD
+            while not detections_output_queue.empty(): # NEW
                 try:
-                    cam_name_out, processed_frame = frame_output_queue.get_nowait()
+                    # cam_name_out, processed_frame = frame_output_queue.get_nowait() # OLD
+                    cam_name_out, processed_frame_shape, processed_detections = detections_output_queue.get_nowait()
                     # Update the frame dictionary used for display
                     with frame_lock: 
-                        latest_frames[cam_name_out] = processed_frame
+                        # latest_frames[cam_name_out] = processed_frame # OLD
+                        latest_detected_objects[cam_name_out] = (processed_detections, processed_frame_shape, time.time())
                 except queue.Empty:
                     break # No more frames for now
                 except Exception as e:
@@ -568,7 +711,10 @@ def inference_loop(appsinks, engine, context):
             # --- Create Combined View (reads latest_frames) ---
             current_frames_copy = {}
             with frame_lock:
-                current_frames_copy = latest_frames.copy() 
+                # current_frames_copy = latest_frames.copy() # OLD: This was for frames with boxes from worker
+                # NEW: We need latest_raw_camera_frames for base, and then overlay from latest_detected_objects
+                raw_frames_snapshot = latest_raw_camera_frames.copy()
+                detections_snapshot = latest_detected_objects.copy()
 
             cam_order = ["mipi_0", "mipi_1", "mipi_2", "mipi_3", "thermal", "placeholder"]
             display_tiles = []
@@ -579,10 +725,23 @@ def inference_loop(appsinks, engine, context):
                     display_tiles.append(placeholder_tile)
                     continue
 
-                frame = current_frames_copy.get(cam_name)
-                if frame is not None:
-                    # Frame should already be correct size (640x480 BGR with boxes)
-                    display_tiles.append(frame)
+                # frame = current_frames_copy.get(cam_name) # OLD
+                # NEW display logic:
+                display_frame = raw_frames_snapshot.get(cam_name)
+
+                if display_frame is not None:
+                    display_frame = display_frame.copy() # Work on a copy for drawing
+                    # Check for detections and draw them
+                    detection_data = detections_snapshot.get(cam_name)
+                    if detection_data:
+                        detections_list, _, detection_timestamp = detection_data
+                        # Optional: Check if detection_timestamp is fresh enough
+                        if time.time() - detection_timestamp < 4.0: # Only draw detections less than 4 sec old (increased from 1.0)
+                            for (x1, y1, x2, y2, score, class_id) in detections_list:
+                                cv2.rectangle(display_frame, (x1, y1), (x2, y2), (0, 255, 0), 2)
+                                label = f"C{int(class_id)}: {score:.2f}"
+                                cv2.putText(display_frame, label, (x1, y1 - 10), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 0), 2)
+                    display_tiles.append(display_frame)
                 else:
                     display_tiles.append(placeholder_tile)
             
@@ -634,7 +793,8 @@ def main():
     global tensorrt_engine, tensorrt_context
     global host_inputs, cuda_inputs, host_outputs, cuda_outputs, stream
     global DYNAMIC_THERMAL_CAM_DEVICE # Make it global here to set it
-    global YOLO_INPUT_SHAPE, YOLO_OUTPUT_NAMES # Explicitly declare as global
+    global YOLO_INPUT_SHAPE, YOLO_OUTPUT_NAMES, YOLO_MODEL_OUTPUT_SHAPE # Explicitly declare all as global
+    global TILE_WIDTH, TILE_HEIGHT # To update them based on YOLO_INPUT_SHAPE
 
     print("Script starting...")
     Gst.init(None) # Initialize GStreamer
@@ -687,8 +847,10 @@ def main():
             # Ensure these are None before attempting to set them from engine
             YOLO_INPUT_SHAPE = None
             YOLO_OUTPUT_NAMES = None
+            YOLO_MODEL_OUTPUT_SHAPE = None # Initialize global here as well
             cuda_context = None # Initialize for the finally block
             worker_thread = None # Initialize for the finally block
+            model_output_shape_from_engine = None # Temporary holder
             try:
                 print("Attempting to init CUDA driver and retain/push primary context...")
                 cuda.init() # Explicitly initialize the driver API first
@@ -726,6 +888,14 @@ def main():
                             if len(YOLO_INPUT_SHAPE) == 4 and YOLO_INPUT_SHAPE[0] == 1:
                                 YOLO_INPUT_SHAPE = YOLO_INPUT_SHAPE[1:] # Use CHW
                                 print(f"Adjusted YOLO_INPUT_SHAPE to CHW: {YOLO_INPUT_SHAPE}")
+                            
+                            # Update TILE_WIDTH and TILE_HEIGHT based on actual model input dimensions
+                            if YOLO_INPUT_SHAPE and len(YOLO_INPUT_SHAPE) == 3:
+                                TILE_HEIGHT = YOLO_INPUT_SHAPE[1] # H from (C,H,W)
+                                TILE_WIDTH = YOLO_INPUT_SHAPE[2]  # W from (C,H,W)
+                                print(f"Display TILE_WIDTH and TILE_HEIGHT updated to: {TILE_WIDTH}x{TILE_HEIGHT}")
+                            else:
+                                print("Warning: Could not update TILE_WIDTH/HEIGHT from YOLO_INPUT_SHAPE.")
 
                             host_inputs.append(cuda.pagelocked_empty(trt.volume(binding_shape), dtype=binding_dtype))
                             cuda_inputs.append(cuda.mem_alloc(host_inputs[-1].nbytes))
@@ -736,7 +906,11 @@ def main():
                         host_outputs.append(cuda.pagelocked_empty(trt.volume(binding_shape), dtype=binding_dtype))
                         cuda_outputs.append(cuda.mem_alloc(host_outputs[-1].nbytes))
                         output_shapes_map[binding_name] = tuple(binding_shape)
-                        print(f"Detected YOLO output '{binding_name}' with shape {binding_shape} and dtype {binding_dtype}")
+                        # Capture the shape of the first output binding encountered
+                        if model_output_shape_from_engine is None:
+                            model_output_shape_from_engine = tuple(binding_shape)
+                            print(f"Detected first YOLO output '{binding_name}' with shape {model_output_shape_from_engine} and dtype {binding_dtype}")
+                        # print(f"Detected YOLO output '{binding_name}' with shape {binding_shape} and dtype {binding_dtype}") # Original print
 
                 if YOLO_INPUT_SHAPE is None:
                     print("ERROR: Could not determine YOLO input shape from TensorRT engine.")
@@ -744,6 +918,11 @@ def main():
                 if not YOLO_OUTPUT_NAMES:
                     print("ERROR: Could not determine YOLO output names from TensorRT engine.")
                     sys.exit(1)
+                if model_output_shape_from_engine is None:
+                    print("ERROR: Could not determine model output shape from TensorRT engine bindings.")
+                    sys.exit(1)
+                
+                YOLO_MODEL_OUTPUT_SHAPE = model_output_shape_from_engine
 
                 stream = cuda.Stream()
                 PYCUDA_INITIALIZED_SUCCESSFULLY = True # Mark success
@@ -761,8 +940,14 @@ def main():
         
         else: # PyCUDA not available path
             print("PyCUDA driver import failed. Inference will be skipped.")
-            # ... (ensure globals are None) ...
-            if YOLO_INPUT_SHAPE is None: YOLO_INPUT_SHAPE = (3, 640, 640) # Default for fallback display?
+            if YOLO_INPUT_SHAPE is None: 
+                YOLO_INPUT_SHAPE = (3, 640, 640) # Default for fallback display
+                print(f"Defaulting YOLO_INPUT_SHAPE to {YOLO_INPUT_SHAPE} for display-only mode.")
+            # Update TILE_WIDTH and TILE_HEIGHT for display-only mode as well
+            if YOLO_INPUT_SHAPE and len(YOLO_INPUT_SHAPE) == 3:
+                TILE_HEIGHT = YOLO_INPUT_SHAPE[1]
+                TILE_WIDTH = YOLO_INPUT_SHAPE[2]
+                print(f"Display TILE_WIDTH and TILE_HEIGHT (display-only) updated to: {TILE_WIDTH}x{TILE_HEIGHT}")
 
         appsinks, pipelines = initialize_gstreamer_pipelines()
         if not appsinks or not pipelines:
@@ -802,17 +987,24 @@ def main():
                 # Use the same display logic from check_cv_events 
                 def check_cv_events_display_only():
                     # Process frames from the output queue (won't be any, but harmless)
-                    while not frame_output_queue.empty(): frame_output_queue.get_nowait()
+                    while not detections_output_queue.empty(): detections_output_queue.get_nowait()
                     
                     current_frames_copy = {}
-                    with frame_lock: current_frames_copy = latest_frames.copy()
+                    with frame_lock: 
+                        raw_frames_snapshot = latest_raw_camera_frames.copy()
+                        detections_snapshot = latest_detected_objects.copy() # Though this will be empty here
+
                     cam_order = ["mipi_0", "mipi_1", "mipi_2", "mipi_3", "thermal", "placeholder"]
                     display_tiles = []
                     placeholder_tile = np.zeros((TILE_HEIGHT, TILE_WIDTH, 3), dtype=np.uint8)
                     for cam_name in cam_order:
                         if cam_name == "placeholder": display_tiles.append(placeholder_tile); continue
-                        frame = current_frames_copy.get(cam_name)
-                        if frame is not None: display_tiles.append(frame)
+                        # frame = current_frames_copy.get(cam_name) # OLD
+                        # NEW for display-only mode (no detections to draw)
+                        display_frame = raw_frames_snapshot.get(cam_name)
+
+                        if display_frame is not None: 
+                            display_tiles.append(display_frame) # Already a BGR frame
                         else: display_tiles.append(placeholder_tile)
                     if len(display_tiles) == 6:
                          try:
