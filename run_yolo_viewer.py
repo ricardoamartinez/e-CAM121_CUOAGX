@@ -8,6 +8,7 @@ import gi
 import warnings # Added
 import threading # Added
 import queue # Added
+import traceback  # add this at the top if not already imported
 
 # Attempt to import and initialize PyCUDA early and make its availability clear
 PYCUDA_AVAILABLE = False
@@ -36,9 +37,9 @@ import tensorrt as trt # For TensorRT runtime
 import numpy as np
 
 # Constants
-ONNX_MODEL_PATH = "/media/gt/My Passport/onnx_model/yolov8s.onnx"
-ENGINE_FILE_PATH = "yolov8s.engine" # Or .trt
-NUM_MIPI_CAMERAS = 4
+ONNX_MODEL_PATH = "US_BTR80.onnx"
+ENGINE_FILE_PATH = "US_BTR80.engine" # .engine or .trt
+NUM_MIPI_CAMERAS = 3
 THERMAL_CAM_DEVICE = "/dev/video1" # As determined previously
 DYNAMIC_THERMAL_CAM_DEVICE = None # Will be set by find_thermal_camera_device
 
@@ -53,7 +54,7 @@ MIPI_WIDTH = 2028
 MIPI_HEIGHT = 1112
 MIPI_FRAMERATE = 60
 TARGET_WIDTH = 640 # Added
-TARGET_HEIGHT = 480 # Added
+TARGET_HEIGHT = 640 # Added
 
 # Expected YOLO input shape (channels, height, width)
 YOLO_MODEL_PRECISION = np.float32
@@ -244,27 +245,25 @@ def initialize_gstreamer_pipelines():
         pipeline_target_h = TARGET_HEIGHT
         print(f"Warning: Using default TARGET_WIDTH/HEIGHT for GStreamer: {pipeline_target_w}x{pipeline_target_h}")
     else:
-        pipeline_target_h = YOLO_INPUT_SHAPE[1] # Height is dimension 1 (C, H, W)
-        pipeline_target_w = YOLO_INPUT_SHAPE[2] # Width is dimension 2
+        pipeline_target_h = YOLO_INPUT_SHAPE[2] # Height is dimension 2 (C, H, W)
+        pipeline_target_w = YOLO_INPUT_SHAPE[3] # Width is dimension 3
         print(f"GStreamer target resolution set to: {pipeline_target_w}x{pipeline_target_h} (from YOLO_INPUT_SHAPE)")
 
     # --- MIPI Cameras ---
     for i in range(NUM_MIPI_CAMERAS):
         # Calculate scaled dimensions for MIPI camera to fit within pipeline_target_w/h
-        scaled_mipi_w, scaled_mipi_h = get_scaled_dimensions(
-            MIPI_WIDTH, MIPI_HEIGHT, pipeline_target_w, pipeline_target_h
-        )
-        print(f"MIPI Cam {i}: Original {MIPI_WIDTH}x{MIPI_HEIGHT} -> Scaled by GStreamer to {scaled_mipi_w}x{scaled_mipi_h} (BGR for appsink). OpenCV will pad.")
+        scaled_mipi_w = pipeline_target_w
+        scaled_mipi_h = pipeline_target_h
 
+        print(f"MIPI Cam {i}: Original {MIPI_WIDTH}x{MIPI_HEIGHT} -> Scaled by GStreamer to {scaled_mipi_w}x{scaled_mipi_h} (BGR for appsink). OpenCV will pad.")
+    
         pipeline_str = (
             f"nvarguscamerasrc sensor-id={i} sensor-mode={MIPI_SENSOR_MODE} ! "
             f"video/x-raw(memory:NVMM),width={MIPI_WIDTH},height={MIPI_HEIGHT},framerate={MIPI_FRAMERATE}/1,format=NV12 ! "
             # 1. Scale with aspect ratio using nvvidconv (output NVMM at scaled_mipi_w x scaled_mipi_h)
             f"nvvidconv ! video/x-raw(memory:NVMM),width={scaled_mipi_w},height={scaled_mipi_h},format=NV12 ! "
-            # 2. Convert to BGRx system memory, with explicit dimensions
-            f"nvvidconv ! video/x-raw,format=BGRx,width={scaled_mipi_w},height={scaled_mipi_h} ! "
-            # 3. Convert BGRx to BGR
-            f"videoconvert ! video/x-raw,format=BGR ! "
+            # 2. Convert to BGR system memory at scaled_mipi_w x scaled_mipi_h
+            f"nvvidconv ! video/x-raw,format=RGBA,width={scaled_mipi_w},height={scaled_mipi_h} ! "
             f"queue ! "
             f"appsink name=sink{i} emit-signals=true max-buffers=1 drop=true"
         )
@@ -338,8 +337,13 @@ def load_tensorrt_engine(engine_path):
     if not engine:
         print("Failed to deserialize the TensorRT engine.")
         return None, None # Return two Nones
-    
-    context = engine.create_execution_context()
+
+    try:
+        context = engine.create_execution_context()
+    except Exception as e:
+        print(f"[ERROR] Failed to create execution context: {e}")
+        return engine, None
+
     if not context:
         print("Failed to create TensorRT execution context.")
         return engine, None # Return engine and None for context
@@ -529,18 +533,33 @@ def inference_worker(engine, context, bindings, stream, host_input, host_output,
 
     print("Inference worker thread stopping.")
 
-def inference_loop(appsinks, engine, context):
+def inference_loop(appsinks, engine, context, stream, host_inputs, cuda_inputs, host_outputs, cuda_outputs, YOLO_MODEL_OUTPUT_SHAPE):
     """
     Main loop to grab frames, perform inference, and display/output results.
     """
     print("Starting inference loop...")
+
     # ... (Removed PYCUDA_AVAILABLE check as it's handled in main) ...
     # ... (Removed buffer allocation as it's done in main and passed to worker) ...
 
     # --- Get buffer refs created in main --- 
     # This assumes main() populates these lists correctly
-    if not host_inputs or not cuda_inputs or not host_outputs or not cuda_outputs or not stream or YOLO_MODEL_OUTPUT_SHAPE is None:
-        print("CRITICAL ERROR: Buffers, stream, or YOLO_MODEL_OUTPUT_SHAPE not initialized correctly in main before inference_loop.")
+    if not host_inputs:
+        print("[ERROR] host_inputs is empty or None")
+    if not cuda_inputs:
+        print("[ERROR] cuda_inputs is empty or None")
+    if not host_outputs:
+        print("[ERROR] host_outputs is empty or None")
+    if not cuda_outputs:
+        print("[ERROR] cuda_outputs is empty or None")
+    if not stream:
+        print("[ERROR] stream is None")
+    if YOLO_MODEL_OUTPUT_SHAPE is None:
+        print("[ERROR] YOLO_MODEL_OUTPUT_SHAPE is None")
+
+    if (not host_inputs or not cuda_inputs or not host_outputs or
+        not cuda_outputs or not stream or YOLO_MODEL_OUTPUT_SHAPE is None):
+        print("CRITICAL ERROR: One or more required inference components are not initialized correctly.")
         return
         
     # Assuming single input/output for simplicity now
@@ -657,8 +676,11 @@ def inference_loop(appsinks, engine, context):
                     # Only try to paste if the frame has valid dimensions
                     if paste_h > 0 and paste_w > 0 and frame_writable_copy.shape[0] > 0 and frame_writable_copy.shape[1] > 0:
                         try:
-                           letterboxed_frame[y_offset:y_offset+paste_h, x_offset:x_offset+paste_w] = frame_writable_copy[0:paste_h, 0:paste_w]
-                           bgr_frame = letterboxed_frame
+                            letterboxed_frame[y_offset:y_offset+paste_h, x_offset:x_offset+paste_w] = frame_writable_copy[0:paste_h, 0:paste_w]
+                            bgr_frame = letterboxed_frame
+                            if bgr_frame.shape[2] == 4:
+                                print("[DEBUG] Converting BGRA to BGR")
+                                bgr_frame = cv2.cvtColor(bgr_frame, cv2.COLOR_BGRA2BGR)
                         except ValueError as e:
                             print(f"ERROR during letterboxing paste for {current_cam_name_for_log}: {e}")
                             print(f"Canvas: {letterboxed_frame.shape}, Frame: {frame_writable_copy.shape}, Paste slice: y={y_offset}:{y_offset+paste_h}, x={x_offset}:{x_offset+paste_w}")
@@ -851,6 +873,9 @@ def main():
             cuda_context = None # Initialize for the finally block
             worker_thread = None # Initialize for the finally block
             model_output_shape_from_engine = None # Temporary holder
+            tensorrt_engine = None
+            tensorrt_context = None
+
             try:
                 print("Attempting to init CUDA driver and retain/push primary context...")
                 cuda.init() # Explicitly initialize the driver API first
@@ -859,10 +884,21 @@ def main():
                 cuda_context.push() 
                 print("Primary CUDA context pushed successfully.")
                 
+                print("starting load tensorrt engine...")
                 tensorrt_engine, tensorrt_context = load_tensorrt_engine(ENGINE_FILE_PATH)
+                print("exiting tensorrt engine...")
                 if not tensorrt_engine or not tensorrt_context:
                      print("Failed to load TensorRT engine or context. Exiting.")
                      sys.exit(1) 
+
+                print(f"[DEBUG] Engine loaded: {tensorrt_engine is not None}")
+                print(f"[DEBUG] Context loaded: {tensorrt_context is not None}")
+
+                YOLO_INPUT_SHAPE = tensorrt_engine.get_tensor_shape(tensorrt_engine.get_tensor_name(0))
+                YOLO_MODEL_OUTPUT_SHAPE = tensorrt_engine.get_tensor_shape(tensorrt_engine.get_tensor_name(1))
+
+                print(f"[INFO] YOLO_INPUT_SHAPE set to {YOLO_INPUT_SHAPE}")
+                print(f"[INFO] YOLO_MODEL_OUTPUT_SHAPE set to {YOLO_MODEL_OUTPUT_SHAPE}")
 
                 # Clear previous buffer lists just in case
                 host_inputs.clear()
@@ -872,34 +908,29 @@ def main():
                 
                 # Determine YOLO input and output details and allocate buffers
                 output_shapes_map = {} # To store output shapes
+
+                print(f"[DEBUG] TensorRT engine bindings: {tensorrt_engine.num_bindings}")
                 for i in range(tensorrt_engine.num_bindings):
                     binding_name = tensorrt_engine.get_tensor_name(i)
                     binding_shape = tensorrt_context.get_tensor_shape(binding_name)
                     binding_dtype = trt.nptype(tensorrt_engine.get_tensor_dtype(binding_name))
                     
                     print(f"Binding {i}: Name='{binding_name}', Shape={binding_shape}, Dtype={binding_dtype}")
-
                     if tensorrt_engine.get_tensor_mode(binding_name) == trt.TensorIOMode.INPUT:
-                        # Assuming the first input binding is the image
-                        if YOLO_INPUT_SHAPE is None: # Take the first input as the one
-                            YOLO_INPUT_SHAPE = tuple(binding_shape) # CHW or NCHW format
-                            print(f"Detected YOLO input '{binding_name}' with shape: {YOLO_INPUT_SHAPE} and dtype: {binding_dtype}")
+                        print("Enter if statement")
+                        if YOLO_INPUT_SHAPE is None:
+                            YOLO_INPUT_SHAPE = tuple(binding_shape)
+                            print(f"[DEBUG] Detected YOLO input '{binding_name}' with shape: {YOLO_INPUT_SHAPE} and dtype: {binding_dtype}")
                             # Ensure it's CHW, if NCHW and N=1, take CHW
-                            if len(YOLO_INPUT_SHAPE) == 4 and YOLO_INPUT_SHAPE[0] == 1:
-                                YOLO_INPUT_SHAPE = YOLO_INPUT_SHAPE[1:] # Use CHW
-                                print(f"Adjusted YOLO_INPUT_SHAPE to CHW: {YOLO_INPUT_SHAPE}")
-                            
-                            # Update TILE_WIDTH and TILE_HEIGHT based on actual model input dimensions
-                            if YOLO_INPUT_SHAPE and len(YOLO_INPUT_SHAPE) == 3:
-                                TILE_HEIGHT = YOLO_INPUT_SHAPE[1] # H from (C,H,W)
-                                TILE_WIDTH = YOLO_INPUT_SHAPE[2]  # W from (C,H,W)
-                                print(f"Display TILE_WIDTH and TILE_HEIGHT updated to: {TILE_WIDTH}x{TILE_HEIGHT}")
-                            else:
-                                print("Warning: Could not update TILE_WIDTH/HEIGHT from YOLO_INPUT_SHAPE.")
 
-                            host_inputs.append(cuda.pagelocked_empty(trt.volume(binding_shape), dtype=binding_dtype))
-                            cuda_inputs.append(cuda.mem_alloc(host_inputs[-1].nbytes))
+                        # Allocate buffers regardless of shape already being known
+                        host_inputs.append(cuda.pagelocked_empty(trt.volume(binding_shape), dtype=binding_dtype))
+                        cuda_inputs.append(cuda.mem_alloc(host_inputs[-1].nbytes))
+                        print(f"[DEBUG] Host inputs: {host_inputs}")
+                        print(f"[DEBUG] CUDA inputs: {cuda_inputs}")
+
                     else:
+                        print("Enter else statement")
                         # Assuming all other bindings are outputs
                         if YOLO_OUTPUT_NAMES is None: YOLO_OUTPUT_NAMES = []
                         YOLO_OUTPUT_NAMES.append(binding_name)
@@ -956,7 +987,7 @@ def main():
 
         # Only start inference loop if PyCUDA/TRT setup was successful
         if PYCUDA_INITIALIZED_SUCCESSFULLY:
-            inference_loop(appsinks, tensorrt_engine, tensorrt_context) 
+            inference_loop(appsinks, tensorrt_engine, tensorrt_context, stream, host_inputs, cuda_inputs, host_outputs, cuda_outputs, YOLO_MODEL_OUTPUT_SHAPE)
         else:
             print("Skipping inference loop as CUDA/TensorRT setup failed or PyCUDA is unavailable.")
             # Optionally start a simple display loop here if desired
